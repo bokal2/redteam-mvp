@@ -23,7 +23,6 @@ logger = logging.getLogger(__name__)
 
 
 async def _run_single_prompt(
-    session,
     exp_id: str,
     instruction: str,
     model: str,
@@ -59,7 +58,10 @@ async def _run_single_prompt(
 
     # 3) judge, optionally using OpenAI
     selected_openai_model = judge_model or "gpt-4o-mini"
-    local_judge_model = judge_model or model
+    # If we're primarily using OpenAI, fall back to the experiment's base model for local judging.
+    local_judge_model = (
+        judge_model if not use_openai_judge else model
+    )
     judge_result: Optional[Dict[str, Any]] = None
     openai_error: Optional[Exception] = None
 
@@ -104,17 +106,18 @@ async def _run_single_prompt(
                 f"local_judge_error:{exc.__class__.__name__}", local_judge_model
             )
 
-    # 4) persist
-    run_record = Run(
-        experiment_id=exp_id,
-        prompt=prompt_text,
-        response=response_text,
-        detector_scores={"toxicity": tox_scores, "pii": pii_scores},
-        judge_scores=judge_result,
-    )
-    session.add(run_record)
-    await session.commit()
-    await session.refresh(run_record)
+    # 4) persist using a fresh session per run so concurrent workers do not share state
+    async with AsyncSessionLocal() as session:
+        run_record = Run(
+            experiment_id=exp_id,
+            prompt=prompt_text,
+            response=response_text,
+            detector_scores={"toxicity": tox_scores, "pii": pii_scores},
+            judge_scores=judge_result,
+        )
+        session.add(run_record)
+        await session.commit()
+        await session.refresh(run_record)
 
     return {
         "run_id": run_record.id,
@@ -158,7 +161,7 @@ async def run_full_experiment(
         Dict with summary and list of run results.
     """
     prompts = generate_prompts(instruction, extra_modifiers)
-    results: List[Dict[str, Any]] = []
+    results: List[Optional[Dict[str, Any]]] = [None] * len(prompts)
 
     async with AsyncSessionLocal() as session:
         # Validate experiment exists
@@ -167,40 +170,41 @@ async def run_full_experiment(
         if not experiment:
             raise ValueError("Experiment not found")
 
-        # Worker semaphore for bounded concurrency
-        sem = asyncio.Semaphore(parallelism)
+    # Worker semaphore for bounded concurrency
+    sem = asyncio.Semaphore(parallelism)
 
-        async def worker(prompt_text: str):
-            async with sem:
-                return await _run_single_prompt(
-                    session=session,
-                    exp_id=exp_id,
-                    instruction=instruction,
-                    model=model,
-                    prompt_text=prompt_text,
-                    use_openai_judge=use_openai_judge,
-                    judge_model=judge_model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
+    async def worker(idx: int, prompt_text: str):
+        async with sem:
+            res = await _run_single_prompt(
+                exp_id=exp_id,
+                instruction=instruction,
+                model=model,
+                prompt_text=prompt_text,
+                use_openai_judge=use_openai_judge,
+                judge_model=judge_model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            results[idx] = res
 
-        tasks = [asyncio.create_task(worker(p)) for p in prompts]
-        # Preserve order mapping prompt -> result
-        for coro in asyncio.as_completed(tasks):
-            res = await coro
-            results.append(res)
+    tasks = [
+        asyncio.create_task(worker(idx, prompt_text))
+        for idx, prompt_text in enumerate(prompts)
+    ]
+    await asyncio.gather(*tasks)
 
     # Build summary (basic)
-    total = len(results)
+    completed_results = [r for r in results if r is not None]
+    total = len(completed_results)
     passed = sum(
-        1 for r in results if (r.get("judge_scores") or {}).get("overall_pass")
+        1 for r in completed_results if (r.get("judge_scores") or {}).get("overall_pass")
     )
     pass_rate = (passed / total) if total else 0.0
 
     # Average toxicity (using Detoxify's 'toxicity' if present)
     tox_vals: List[float] = []
     privacy_vals: List[float] = []
-    for r in results:
+    for r in completed_results:
         det = r.get("detector_scores") or {}
         tox = det.get("toxicity") or {}
         if isinstance(tox, dict):
@@ -223,5 +227,5 @@ async def run_full_experiment(
             "avg_toxicity": avg_toxicity,
             "avg_privacy_risk": avg_privacy_risk,
         },
-        "runs": results,
+        "runs": completed_results,
     }

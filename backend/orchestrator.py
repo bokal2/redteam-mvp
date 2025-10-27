@@ -3,229 +3,426 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Dict, List, Optional, Any
+import os
+import time
+from typing import Any, Dict, List, Optional
 
 from sqlmodel import select
 
 from .db import AsyncSessionLocal
+from .detectors import run_pii_checks, run_toxicity
+from .judge import (
+    fallback_scores,
+    openai_client_available,
+    run_judge_local_async,
+    run_judge_openai_async,
+)
 from .models import Experiment, Run
 from .ola_client import generate as ola_generate
-from .prompts import generate_prompts
-from .detectors import run_toxicity, run_pii_checks
-from .judge import (
-    run_judge_openai_async,
-    run_judge_local_async,
-    openai_client_available,
-    fallback_scores,
-)
+from .prompts import REFUSAL_TOKEN, generate_prompts, is_potentially_unsafe
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
-async def _run_single_prompt(
-    exp_id: str,
-    instruction: str,
-    model: str,
-    prompt_text: str,
-    use_openai_judge: bool = True,
-    judge_model: Optional[str] = None,
-    temperature: float = 0.0,
-    max_tokens: int = 1024,
-) -> Dict[str, Any]:
-    """
-    Executes the full flow for a single adversarial prompt:
-      1) Call LLM (Ollama)
-      2) Run detectors (toxicity + PII)
-      3) Run judge (OpenAI or local Ollama fallback)
-      4) Persist Run
-    Returns a dict with persisted run data.
-    """
-    # 1) model generation
-    gen = await ola_generate(
-        model=model,
-        prompt=prompt_text,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
-    response_text = gen.get("text", "") if isinstance(gen, dict) else str(gen)
+# Explicit opt-in to allow unsafe prompts to flow to the model.
+REDTEAM_ALLOW_UNSAFE = os.getenv("REDTEAM_ALLOW_UNSAFE", "0") == "1"
 
-    # 2) detectors (CPU-bound but fast; run in threadpool)
-    loop = asyncio.get_event_loop()
 
-    tox_future = loop.run_in_executor(None, run_toxicity, response_text)
-    pii_future = loop.run_in_executor(None, run_pii_checks, response_text)
-    tox_scores, pii_scores = await asyncio.gather(tox_future, pii_future)
+class RedTeamAgent:
+    """Coordinates prompt generation, model calls, detectors, and judging."""
 
-    # 3) judge, optionally using OpenAI
-    selected_openai_model = judge_model or "gpt-4o-mini"
-    # If we're primarily using OpenAI, fall back to the experiment's base model for local judging.
-    local_judge_model = (
-        judge_model if not use_openai_judge else model
-    )
-    judge_result: Optional[Dict[str, Any]] = None
-    openai_error: Optional[Exception] = None
+    def __init__(
+        self,
+        *,
+        session_factory=AsyncSessionLocal,
+        concurrency: int = 3,
+        model_timeout: int = 30,
+    ) -> None:
+        self._session_factory = session_factory
+        self._concurrency = max(1, concurrency)
+        self._model_timeout = model_timeout
 
-    if use_openai_judge and openai_client_available():
-        try:
-            judge_result = await run_judge_openai_async(
-                instruction=instruction,
-                response=response_text,
-                model=selected_openai_model,
-                temperature=0.0,
-                max_tokens=400,
-                retries=2,
-            )
-        except Exception as exc:
-            openai_error = exc
-            logger.warning(
-                "OpenAI judge failed (%s); falling back to local judge.",
-                exc,
-            )
-    elif use_openai_judge and not openai_client_available():
-        logger.warning("OpenAI judge requested but client unavailable; using local judge instead.")
-
-    if judge_result is None:
-        try:
-            judge_result = await run_judge_local_async(
-                instruction=instruction,
-                response=response_text,
-                model=local_judge_model,
-                temperature=0.0,
-                max_tokens=400,
-                retries=2,
-            )
-            if openai_error:
-                existing_note = judge_result.get("notes", "")
-                suffix = f"OpenAI fallback due to {openai_error.__class__.__name__}"
-                judge_result["notes"] = (
-                    f"{existing_note}; {suffix}" if existing_note else suffix
-                )
-        except Exception as exc:
-            logger.error("Local judge failed (%s). Returning fallback scores.", exc)
-            judge_result = fallback_scores(
-                f"local_judge_error:{exc.__class__.__name__}", local_judge_model
-            )
-
-    # 4) persist using a fresh session per run so concurrent workers do not share state
-    async with AsyncSessionLocal() as session:
-        run_record = Run(
-            experiment_id=exp_id,
-            prompt=prompt_text,
-            response=response_text,
-            detector_scores={"toxicity": tox_scores, "pii": pii_scores},
-            judge_scores=judge_result,
+    async def run_experiment(
+        self,
+        *,
+        experiment_id: str,
+        instruction: str,
+        model: str,
+        use_openai_judge: bool,
+        judge_model: Optional[str],
+        temperature: float,
+        max_tokens: int,
+        prompt_texts: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        experiment = await self._get_experiment(experiment_id)
+        if not prompt_texts:
+            raise ValueError("No prompts provided for run.")
+        prompts = generate_prompts(
+            instruction=instruction,
+            user_prompts=prompt_texts,
         )
-        session.add(run_record)
-        await session.commit()
-        await session.refresh(run_record)
 
-    return {
-        "run_id": run_record.id,
-        "prompt": prompt_text,
-        "response": response_text,
-        "detector_scores": run_record.detector_scores,
-        "judge_scores": run_record.judge_scores,
-    }
+        semaphore = asyncio.Semaphore(self._concurrency)
+        results: List[Optional[Dict[str, Any]]] = [None] * len(prompts)
+
+        async def worker(idx: int, prompt_obj: Dict[str, Any]) -> None:
+            async with semaphore:
+                try:
+                    results[idx] = await self._execute_prompt(
+                        experiment_id=experiment.id,
+                        instruction=instruction,
+                        model=model,
+                        prompt_obj=prompt_obj,
+                        use_openai_judge=use_openai_judge,
+                        judge_model=judge_model,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.exception(
+                        "RedTeamAgent worker failed for modifier=%s",
+                        prompt_obj.get("modifier_id"),
+                    )
+                    results[idx] = {
+                        "run_id": None,
+                        "prompt": prompt_obj.get("prompt_text"),
+                        "response": None,
+                        "detector_scores": None,
+                        "judge_scores": fallback_scores(
+                            f"worker_error:{exc.__class__.__name__}"
+                        ),
+                        "blocked": False,
+                        "error": str(exc),
+                        "modifier_id": prompt_obj.get("modifier_id"),
+                        "modifier_category": prompt_obj.get("modifier_category"),
+                    }
+
+        await asyncio.gather(
+            *(asyncio.create_task(worker(idx, prompt)) for idx, prompt in enumerate(prompts))
+        )
+
+        completed = [r for r in results if r is not None]
+        summary = self._summarize_runs(completed)
+
+        return {
+            "experiment_id": experiment.id,
+            "model": model,
+            "instruction": instruction,
+            "summary": summary,
+            "runs": completed,
+        }
+
+    async def _get_experiment(self, experiment_id: str) -> Experiment:
+        async with self._session_factory() as session:
+            query = await session.exec(
+                select(Experiment).where(Experiment.id == experiment_id)
+            )
+            experiment = query.one_or_none()
+            if experiment is None:
+                raise ValueError("Experiment not found")
+            return experiment
+
+    async def _execute_prompt(
+        self,
+        *,
+        experiment_id: str,
+        instruction: str,
+        model: str,
+        prompt_obj: Dict[str, Any],
+        use_openai_judge: bool,
+        judge_model: Optional[str],
+        temperature: float,
+        max_tokens: int,
+    ) -> Dict[str, Any]:
+        prompt_text = prompt_obj["prompt_text"]
+        modifier_id = prompt_obj.get("modifier_id")
+        modifier_category = prompt_obj.get("modifier_category")
+
+        metadata_payload = {
+            "modifier_text": prompt_obj.get("modifier_text"),
+            "judge_model": judge_model,
+            "use_openai_judge": use_openai_judge,
+            "model": model,
+            "timestamp": int(time.time()),
+        }
+
+        if self._should_block_prompt(instruction, prompt_text):
+            logger.info(
+                "Blocking prompt for modifier=%s due to safety gate", modifier_id
+            )
+            detector_scores = {
+                "toxicity": {"toxicity": 0.0},
+                "pii": {"privacy_risk": 0.0},
+            }
+            judge_scores = {
+                "safety": 1.0,
+                "privacy_risk": 0.0,
+                "bias": 0.0,
+                "instruction_following": 0.0,
+                "overall_pass": False,
+                "notes": "Blocked by safety gate (keyword match)",
+            }
+            run_record = await self._persist_run(
+                experiment_id=experiment_id,
+                instruction=instruction,
+                prompt_obj=prompt_obj,
+                response=REFUSAL_TOKEN,
+                blocked=True,
+                detector_scores=detector_scores,
+                judge_scores=judge_scores,
+                error=None,
+                metadata=metadata_payload | {"blocked_reason": "keyword_match"},
+            )
+            return self._serialize_run(run_record)
+
+        response_text = await self._call_model_with_timeout(
+            model=model,
+            prompt=prompt_text,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+        detector_scores = await self._run_detectors(response_text)
+        judge_scores = await self._run_judges(
+            instruction=instruction,
+            response=response_text,
+            model=model,
+            use_openai_judge=use_openai_judge,
+            judge_model=judge_model,
+        )
+
+        run_record = await self._persist_run(
+            experiment_id=experiment_id,
+            instruction=instruction,
+            prompt_obj=prompt_obj,
+            response=response_text,
+            blocked=False,
+            detector_scores=detector_scores,
+            judge_scores=judge_scores,
+            error=None,
+            metadata=metadata_payload,
+        )
+        return self._serialize_run(run_record)
+
+    @staticmethod
+    def _should_block_prompt(instruction: str, prompt_text: str) -> bool:
+        if REDTEAM_ALLOW_UNSAFE:
+            return False
+        return is_potentially_unsafe(instruction) or is_potentially_unsafe(prompt_text)
+
+    async def _call_model_with_timeout(
+        self, *, model: str, prompt: str, temperature: float, max_tokens: int
+    ) -> str:
+        try:
+            generate_coro = ola_generate(
+                model=model,
+                prompt=prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            result = await asyncio.wait_for(generate_coro, timeout=self._model_timeout)
+        except asyncio.TimeoutError:
+            logger.error("Model call timed out for model=%s", model)
+            return "[ERROR:MODEL_TIMEOUT]"
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("Model call error for model=%s", model)
+            return f"[ERROR:MODEL_EXCEPTION:{exc.__class__.__name__}]"
+
+        if isinstance(result, dict):
+            return (
+                result.get("text")
+                or result.get("completion")
+                or result.get("response")
+                or str(result)
+            )
+        return str(result)
+
+    async def _run_detectors(self, response_text: str) -> Dict[str, Any]:
+        try:
+            tox_scores, pii_scores = await asyncio.gather(
+                asyncio.to_thread(run_toxicity, response_text),
+                asyncio.to_thread(run_pii_checks, response_text),
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("Detector pipeline failed: %s", exc)
+            return {
+                "toxicity": {"error": f"detector_failed:{exc.__class__.__name__}"},
+                "pii": {"privacy_risk": 0.0},
+            }
+
+        return {"toxicity": tox_scores or {}, "pii": pii_scores or {}}
+
+    async def _run_judges(
+        self,
+        *,
+        instruction: str,
+        response: str,
+        model: str,
+        use_openai_judge: bool,
+        judge_model: Optional[str],
+    ) -> Dict[str, Any]:
+        openai_model = judge_model or "gpt-4o-mini"
+        local_model = judge_model if (judge_model and not use_openai_judge) else model
+        openai_error: Optional[Exception] = None
+        judge_result: Optional[Dict[str, Any]] = None
+
+        if use_openai_judge and openai_client_available():
+            try:
+                judge_result = await run_judge_openai_async(
+                    instruction=instruction,
+                    response=response,
+                    model=openai_model,
+                    temperature=0.0,
+                    max_tokens=400,
+                    retries=2,
+                )
+            except Exception as exc:
+                openai_error = exc
+                logger.warning(
+                    "OpenAI judge failed (%s); falling back to local judge", exc
+                )
+
+        if judge_result is None:
+            try:
+                judge_result = await run_judge_local_async(
+                    instruction=instruction,
+                    response=response,
+                    model=local_model,
+                    temperature=0.0,
+                    max_tokens=400,
+                    retries=2,
+                )
+                if openai_error:
+                    note = judge_result.get("notes", "")
+                    suffix = f"OpenAI fallback: {openai_error.__class__.__name__}"
+                    judge_result["notes"] = f"{note}; {suffix}" if note else suffix
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.exception("Local judge failed: %s", exc)
+                judge_result = fallback_scores(
+                    f"local_judge_error:{exc.__class__.__name__}", local_model
+                )
+
+        return judge_result or fallback_scores("judge_unavailable", local_model)
+
+    async def _persist_run(
+        self,
+        *,
+        experiment_id: str,
+        instruction: str,
+        prompt_obj: Dict[str, Any],
+        response: Optional[str],
+        blocked: bool,
+        detector_scores: Optional[Dict[str, Any]],
+        judge_scores: Optional[Dict[str, Any]],
+        error: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> Run:
+        async with self._session_factory() as session:
+            run_record = Run(
+                experiment_id=experiment_id,
+                base_instruction=instruction,
+                prompt=prompt_obj.get("prompt_text", ""),
+                response=response,
+                blocked=blocked,
+                error=error,
+                modifier_id=prompt_obj.get("modifier_id"),
+                modifier_category=prompt_obj.get("modifier_category"),
+                detector_scores=detector_scores,
+                judge_scores=judge_scores,
+                run_metadata=metadata,
+            )
+            session.add(run_record)
+            await session.commit()
+            await session.refresh(run_record)
+            return run_record
+
+    @staticmethod
+    def _serialize_run(run_record: Run) -> Dict[str, Any]:
+        return {
+            "run_id": run_record.id,
+            "prompt": run_record.prompt,
+            "response": run_record.response,
+            "detector_scores": run_record.detector_scores,
+            "judge_scores": run_record.judge_scores,
+            "blocked": run_record.blocked,
+            "error": run_record.error,
+            "modifier_id": run_record.modifier_id,
+            "modifier_category": run_record.modifier_category,
+            "metadata": run_record.run_metadata,
+        }
+
+    @staticmethod
+    def _summarize_runs(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        total = len(runs)
+        blocked = sum(1 for r in runs if r.get("blocked"))
+        errored = sum(1 for r in runs if r.get("error"))
+        passed = sum(
+            1 for r in runs if (r.get("judge_scores") or {}).get("overall_pass")
+        )
+        pass_rate = passed / total if total else 0.0
+
+        tox_vals: List[float] = []
+        pii_vals: List[float] = []
+        for r in runs:
+            det = r.get("detector_scores") or {}
+            tox = det.get("toxicity") or {}
+            if isinstance(tox, dict):
+                val = (
+                    tox.get("toxicity")
+                    or tox.get("toxicity_score")
+                    or tox.get("severe_toxicity")
+                )
+            else:
+                val = tox
+            if isinstance(val, (int, float)):
+                tox_vals.append(float(val))
+
+            pii = det.get("pii") or {}
+            pv = None
+            if isinstance(pii, dict):
+                pv = pii.get("privacy_risk")
+            if isinstance(pv, (int, float)):
+                pii_vals.append(float(pv))
+
+        avg_toxicity = (sum(tox_vals) / len(tox_vals)) if tox_vals else 0.0
+        avg_privacy = (sum(pii_vals) / len(pii_vals)) if pii_vals else 0.0
+
+        return {
+            "total_runs": total,
+            "blocked_runs": blocked,
+            "errored_runs": errored,
+            "passed": passed,
+            "pass_rate": pass_rate,
+            "avg_toxicity": avg_toxicity,
+            "avg_privacy_risk": avg_privacy,
+        }
 
 
 async def run_full_experiment(
+    *,
     exp_id: str,
     instruction: str,
     model: str,
-    *,
-    extra_modifiers: Optional[List[str]] = None,
+    prompt_texts: Optional[List[str]] = None,
     judge_model: Optional[str] = None,
     use_openai_judge: bool = True,
     temperature: float = 0.0,
     max_tokens: int = 1024,
     parallelism: int = 3,
+    model_timeout: int = 30,
 ) -> Dict[str, Any]:
-    """
-    Orchestrates a full experiment:
-      - Generate adversarial prompts
-      - For each prompt: call model -> detectors -> judge -> store
-      - Runs with limited parallelism for speed while keeping system stable
-
-    Args:
-        exp_id: Experiment ID
-        instruction: Base instruction to test (user task)
-        model: Ollama model name for generation (e.g., "llama3.2")
-        extra_modifiers: Optional list of extra adversarial modifiers
-        judge_model: Optional judge model override
-        use_openai_judge: Toggle whether to call OpenAI judge (saves cost if disabled)
-        temperature: Generation temperature (0.0 recommended for eval)
-        max_tokens: Max tokens for generation
-        parallelism: Number of concurrent prompt runs
-
-    Returns:
-        Dict with summary and list of run results.
-    """
-    prompts = generate_prompts(instruction, extra_modifiers)
-    results: List[Optional[Dict[str, Any]]] = [None] * len(prompts)
-
-    async with AsyncSessionLocal() as session:
-        # Validate experiment exists
-        q = await session.exec(select(Experiment).where(Experiment.id == exp_id))
-        experiment = q.one_or_none()
-        if not experiment:
-            raise ValueError("Experiment not found")
-
-    # Worker semaphore for bounded concurrency
-    sem = asyncio.Semaphore(parallelism)
-
-    async def worker(idx: int, prompt_text: str):
-        async with sem:
-            res = await _run_single_prompt(
-                exp_id=exp_id,
-                instruction=instruction,
-                model=model,
-                prompt_text=prompt_text,
-                use_openai_judge=use_openai_judge,
-                judge_model=judge_model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            results[idx] = res
-
-    tasks = [
-        asyncio.create_task(worker(idx, prompt_text))
-        for idx, prompt_text in enumerate(prompts)
-    ]
-    await asyncio.gather(*tasks)
-
-    # Build summary (basic)
-    completed_results = [r for r in results if r is not None]
-    total = len(completed_results)
-    passed = sum(
-        1 for r in completed_results if (r.get("judge_scores") or {}).get("overall_pass")
+    agent = RedTeamAgent(
+        concurrency=parallelism,
+        model_timeout=model_timeout,
     )
-    pass_rate = (passed / total) if total else 0.0
-
-    # Average toxicity (using Detoxify's 'toxicity' if present)
-    tox_vals: List[float] = []
-    privacy_vals: List[float] = []
-    for r in completed_results:
-        det = r.get("detector_scores") or {}
-        tox = det.get("toxicity") or {}
-        if isinstance(tox, dict):
-            val = tox.get("toxicity") or tox.get("toxicity_score") or 0.0
-            if isinstance(val, (int, float)):
-                tox_vals.append(float(val))
-        pii = det.get("pii") or {}
-        pv = pii.get("privacy_risk", 0.0) if isinstance(pii, dict) else 0.0
-        privacy_vals.append(float(pv))
-
-    avg_toxicity = (sum(tox_vals) / len(tox_vals)) if tox_vals else 0.0
-    avg_privacy_risk = (sum(privacy_vals) / len(privacy_vals)) if privacy_vals else 0.0
-
-    return {
-        "experiment_id": exp_id,
-        "summary": {
-            "total_runs": total,
-            "passed": passed,
-            "pass_rate": pass_rate,
-            "avg_toxicity": avg_toxicity,
-            "avg_privacy_risk": avg_privacy_risk,
-        },
-        "runs": completed_results,
-    }
+    return await agent.run_experiment(
+        experiment_id=exp_id,
+        instruction=instruction,
+        model=model,
+        use_openai_judge=use_openai_judge,
+        judge_model=judge_model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        prompt_texts=prompt_texts,
+    )

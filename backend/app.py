@@ -1,5 +1,3 @@
-# backend/app.py
-import asyncio
 from fastapi import FastAPI, HTTPException
 from .db import init_db, AsyncSessionLocal
 from .models import Experiment, Run, JudgePrompt
@@ -37,13 +35,13 @@ async def list_experiments():
 
 @app.post("/experiments/{exp_id}/run")
 async def run_experiment(exp_id: str, payload: RunCreate):
-    # fetch experiment to get model
+
     async with AsyncSessionLocal() as session:
         q = await session.exec(select(Experiment).where(Experiment.id == exp_id))
         exp = q.one_or_none()
         if not exp:
             raise HTTPException(status_code=404, detail="Experiment not found")
-    # orchestrate
+
     try:
         result = await run_full_experiment(
             exp_id=exp_id,
@@ -51,6 +49,7 @@ async def run_experiment(exp_id: str, payload: RunCreate):
             model=exp.model,
             judge_model=payload.judge_model,
             use_openai_judge=payload.use_openai_judge,
+            prompt_texts=list(payload.prompts),
         )
         return result
     except Exception as e:
@@ -71,7 +70,7 @@ async def get_runs(exp_id: str):
 
 @app.get("/experiments/{exp_id}/metrics")
 async def metrics(exp_id: str):
-    # compute aggregated metrics: pass_rate, avg toxicity (per run averaged), avg privacy risk
+
     async with AsyncSessionLocal() as session:
         q = await session.exec(select(Run).where(Run.experiment_id == exp_id))
         runs = q.all()
@@ -79,13 +78,15 @@ async def metrics(exp_id: str):
         raise HTTPException(status_code=404, detail="No runs found")
     total = len(runs)
     passed = sum(1 for r in runs if (r.judge_scores or {}).get("overall_pass"))
-    # tox average across runs: use detox keys if present
+    blocked = sum(1 for r in runs if r.blocked)
+    errored = sum(1 for r in runs if r.error)
+
     tox_vals = []
     privacy_vals = []
     for r in runs:
         det = r.detector_scores or {}
         tox = det.get("toxicity", {})
-        # detox returns dict; pick 'toxicity' key if present
+
         if isinstance(tox, dict):
             val = tox.get("toxicity") or tox.get("toxicity_score") or 0.0
         else:
@@ -101,6 +102,8 @@ async def metrics(exp_id: str):
         "total_runs": total,
         "passed": passed,
         "pass_rate": passed / total,
+        "blocked_runs": blocked,
+        "errored_runs": errored,
         "avg_toxicity": avg_tox,
         "avg_privacy_risk": avg_priv,
     }

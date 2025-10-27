@@ -211,7 +211,7 @@ One per adversarial prompt. Captures prompt, response, detector outputs, judge s
 - `run_pii_checks`: Uses regex, `phonenumbers`, and spaCy NER to estimate privacy risk.
 
 ### Prompt Generation
-`backend/prompts.py` composes a base system prompt and merges curated adversarial modifiers. You can extend `ADVERSARIAL_MODIFIERS` or inject additional modifiers per run (`extra_modifiers` parameter on `run_full_experiment`).
+`backend/prompts.py` now simply tags user-supplied prompts with metadata and does not inject additional modifiers.
 
 ---
 

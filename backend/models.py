@@ -1,5 +1,5 @@
 # backend/models.py
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from sqlalchemy import Column, JSON
 from sqlmodel import SQLModel, Field
 from datetime import datetime
@@ -37,6 +37,27 @@ class Run(SQLModel, table=True):
         default=None,
         sa_column=Column("metadata", JSON),
     )
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class AgentRun(SQLModel, table=True):
+    id: str = Field(default_factory=gen_uuid, primary_key=True, index=True)
+    experiment_id: str = Field(foreign_key="experiment.id", index=True)
+    generator_model: Optional[str] = None
+    prompt_count: int
+    target_temperature: Optional[float] = None
+    metrics_focus: Optional[List[str]] = Field(default=None, sa_column=Column(JSON))
+    guidance: Optional[str] = None
+    request_payload: Optional[Dict[str, Any]] = Field(
+        default=None, sa_column=Column(JSON)
+    )
+    generated_prompts: Optional[List[Dict[str, Any]]] = Field(
+        default=None, sa_column=Column(JSON)
+    )
+    execution_summary: Optional[Dict[str, Any]] = Field(
+        default=None, sa_column=Column(JSON)
+    )
+    run_ids: Optional[List[str]] = Field(default=None, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 

@@ -201,6 +201,23 @@ Stored in `backend/models.py`. Each experiment represents a target model + confi
 ### Runs
 One per adversarial prompt. Captures prompt, response, detector outputs, judge scores, and timestamps. Automatically persisted during orchestration.
 
+### Baseline Experiments
+- **Seed or replay**: `python -m backend.baseline --config baseline/baseline_config.json --out baseline/results`
+- **Artifacts**: CSV/JSON exports live in `baseline/results` and can be refreshed with `--skip-run` if you only need to regenerate the snapshot.
+- **UI comparison**: The Streamlit app reads the selected baseline metrics and surfaces pass-rate/toxicity deltas next to the live experiment.
+- **Customization**: Duplicate the config/results pair to track multiple baselines (e.g., per model family) and point the helper to the new paths.
+
+### Automated Agent Runs
+- **Prompt designer**: `backend/agent.py` uses OpenAI's Responses API or Ollama via the local gateway to craft themed adversarial prompt suites given a metric focus (privacy, toxicity, determinism, etc.).
+- **Execution endpoint**: `POST /experiments/{exp_id}/agent-run` generates prompts, runs them through the harness, and stores the generated suite + summary in `AgentRun` rows.
+- **History & metrics**: `GET /experiments/{exp_id}/agent-runs` returns past suites; `GET /experiments/{exp_id}/agent-metrics` aggregates pass rates and detector means across every automated run.
+- **UI tabs**: The Streamlit frontend now surfaces “Manual Run”, “Agent Lab”, and “Agent Metrics” tabs so operators can switch between hand-crafted prompts, AI-generated suites, and longitudinal visualizations.
+
+### Automation
+- **Regression script**: `python scripts/compare_baseline.py --current <new_metrics.json> --baseline baseline/results/baseline_metrics.json`
+- **Nightly CI**: `.github/workflows/nightly-baseline.yml` installs dependencies, reruns the baseline, compares metrics with configurable thresholds, and uploads the nightly snapshot artifact.
+- **Self-hosted runners** are recommended so the Ollama model referenced by the baseline is reachable; adjust `OLLAMA_HOST` and secrets (e.g., `OPENAI_API_KEY`) as needed for your deployment.
+
 ### Judge Options
 - **OpenAI judge** (`run_judge_openai_async`): Uses GPT-4o series to evaluate safety, privacy, bias, instruction-following, and pass/fail. Retries on parse errors and returns normalized scores.
 - **Local judge** (`run_judge_local_async`): Reuses the same rubric but calls an Ollama-served model. Useful when you need to conserve API credits or operate offline.
@@ -224,6 +241,9 @@ One per adversarial prompt. Captures prompt, response, detector outputs, judge s
 | POST   | `/experiments/{exp_id}/run`        | Trigger a full experiment run. Payload includes `instruction`, optional `judge_model`, and `use_openai_judge` toggle. |
 | GET    | `/experiments/{exp_id}/runs`       | Retrieve all runs for an experiment (most recent first). |
 | GET    | `/experiments/{exp_id}/metrics`    | Summary stats (pass rate, average toxicity/privacy).  |
+| POST   | `/experiments/{exp_id}/agent-run`  | Generate prompts via the OpenAI agent, execute them, and persist results. |
+| GET    | `/experiments/{exp_id}/agent-runs` | List stored automated prompt suites and their summaries. |
+| GET    | `/experiments/{exp_id}/agent-metrics` | Aggregate agent-run metrics (average pass rate, toxicity, privacy). |
 
 Interactive docs are available at `http://localhost:8000/docs` when the backend is running.
 
@@ -247,6 +267,7 @@ Interactive docs are available at `http://localhost:8000/docs` when the backend 
 | spaCy error about `en_core_web_sm` missing | Model not downloaded | Run `python -m spacy download en_core_web_sm`. |
 | Ollama request errors / empty responses | Ollama daemon not running or model missing | Start `ollama serve` and `ollama pull <model>` referenced in experiments. |
 | SQLite locking issues | Running multiple writers simultaneously | Reduce `parallelism` in `run_full_experiment` or move to a managed SQL database. |
+| Agent endpoint returns 503 | `OPENAI_API_KEY` missing or revoked | Export a valid key before calling `/agent-run` so the generator can contact OpenAI. |
 
 ---
 

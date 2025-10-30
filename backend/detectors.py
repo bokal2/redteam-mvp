@@ -1,5 +1,6 @@
 # backend/detectors.py
 import logging
+import os
 import re
 from typing import Dict, Optional
 
@@ -10,7 +11,9 @@ logger = logging.getLogger(__name__)
 
 # ------------ Detoxify helpers -------------
 _detox_model: Optional[object] = None
-_detox_unavailable: bool = False
+_detox_unavailable: bool = os.getenv("REDTEAM_DISABLE_DETOXIFY", "0") == "1"
+if _detox_unavailable:
+    logger.info("Detoxify loading disabled via REDTEAM_DISABLE_DETOXIFY=1.")
 
 
 def _get_detox(model_type: str = "original"):

@@ -4,7 +4,7 @@ from sqlmodel import select
 from .agent import generate_prompts_async
 from .db import AsyncSessionLocal, init_db
 from .models import AgentRun, Experiment, Run
-from .orchestrator import run_full_experiment
+from .orchestrator import RedTeamAgent, run_full_experiment
 from .schemas import AgentRunCreate, ExperimentCreate, RunCreate
 
 app = FastAPI(title="RedTeam Masters Capstone")
@@ -78,38 +78,9 @@ async def metrics(exp_id: str):
         runs = q.all()
     if not runs:
         raise HTTPException(status_code=404, detail="No runs found")
-    total = len(runs)
-    passed = sum(1 for r in runs if (r.judge_scores or {}).get("overall_pass"))
-    blocked = sum(1 for r in runs if r.blocked)
-    errored = sum(1 for r in runs if r.error)
-
-    tox_vals = []
-    privacy_vals = []
-    for r in runs:
-        det = r.detector_scores or {}
-        tox = det.get("toxicity", {})
-
-        if isinstance(tox, dict):
-            val = tox.get("toxicity") or tox.get("toxicity_score") or 0.0
-        else:
-            val = 0.0
-        if isinstance(val, (int, float)):
-            tox_vals.append(val)
-        pii = det.get("pii", {})
-        pv = pii.get("privacy_risk", 0.0) if isinstance(pii, dict) else 0.0
-        privacy_vals.append(pv)
-    avg_tox = (sum(tox_vals) / len(tox_vals)) if tox_vals else 0.0
-    avg_priv = (sum(privacy_vals) / len(privacy_vals)) if privacy_vals else 0.0
-    response = {
-        "total_runs": total,
-        "passed": passed,
-        "pass_rate": passed / total,
-        "blocked_runs": blocked,
-        "errored_runs": errored,
-        "avg_toxicity": avg_tox,
-        "avg_privacy_risk": avg_priv,
-    }
-    return response
+    serialized = [RedTeamAgent._serialize_run(r) for r in runs]
+    summary = RedTeamAgent._summarize_runs(serialized)
+    return summary
 
 
 @app.post("/experiments/{exp_id}/agent-run")

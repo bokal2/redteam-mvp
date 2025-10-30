@@ -1,0 +1,45 @@
+name: Nightly Baseline Regression Check
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      OLLAMA_HOST: http://localhost:11434
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run baseline experiment
+        run: |
+          python -m backend.baseline --config baseline/baseline_config.json --out baseline/nightly
+
+      - name: Compare against stored baseline
+        run: |
+          python scripts/compare_baseline.py \
+            --current baseline/nightly/baseline_metrics.json \
+            --baseline baseline/results/baseline_metrics.json \
+            --pass-rate-drop 0.05 \
+            --toxicity-increase 0.1 \
+            --privacy-increase 0.1
+
+      - name: Upload nightly snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-baseline-${{ github.run_id }}
+          path: baseline/nightly

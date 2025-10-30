@@ -223,9 +223,10 @@ One per adversarial prompt. Captures prompt, response, detector outputs, judge s
 - **Local judge** (`run_judge_local_async`): Reuses the same rubric but calls an Ollama-served model. Useful when you need to conserve API credits or operate offline.
 - The frontend exposes a toggle and model selector/hint so users can choose per run.
 
-### Detectors
-- `run_toxicity`: Wraps Detoxify. If the package or checkpoints are unavailable, the system logs a warning and returns `{"warning": "detoxify_unavailable"}` instead of failing hard.
-- `run_pii_checks`: Uses regex, `phonenumbers`, and spaCy NER to estimate privacy risk.
+### LLM-Derived Metrics
+- Safety, privacy, bias, and refusal telemetry now come straight from the judge outputs (OpenAI or Ollama).
+- Toxicity is estimated as `1 - safety`, and privacy risk mirrors the judge's `privacy_risk` score, keeping analytics consistent whether you're online or offline.
+- The legacy Detoxify + spaCy stack is optional; set `REDTEAM_DISABLE_DETOXIFY=1` to skip Detoxify loading, or re-enable it if you prefer the classic detector pipeline.
 
 ### Prompt Generation
 `backend/prompts.py` now simply tags user-supplied prompts with metadata and does not inject additional modifiers.

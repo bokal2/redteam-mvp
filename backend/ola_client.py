@@ -16,17 +16,23 @@ async def generate(
         "max_tokens": max_tokens,
         "stream": False,
     }
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, json=payload)
-        r.raise_for_status()
-        data = r.json()
-        # Data structure from Ollama may vary; normalize to access a text string
-        # Many Ollama responses contain 'completion' or 'text' or similar fields.
-        # We'll attempt to find joined text:
-        if isinstance(data, dict):
-            # try a few keys
-            for k in ("completion", "text", "response", "outputs"):
-                if k in data:
-                    return {"raw": data, "text": data[k]}
-        # fallback: stringified
-        return {"raw": data, "text": str(data)}
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(url, json=payload)
+            r.raise_for_status()
+            data = r.json()
+    except httpx.RequestError as exc:
+        raise RuntimeError(
+            f"Ollama request failed for model '{model}' ({exc.__class__.__name__}: {exc})"
+        ) from exc
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(
+            f"Ollama returned HTTP {exc.response.status_code} for model '{model}': {exc.response.text}"
+        ) from exc
+
+    if isinstance(data, dict):
+        for key in ("completion", "text", "response", "outputs"):
+            if key in data:
+                return {"raw": data, "text": data[key]}
+
+    return {"raw": data, "text": str(data)}

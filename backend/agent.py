@@ -211,7 +211,11 @@ async def generate_prompts_async(
     except (json.JSONDecodeError, TypeError) as exc:
         raise HTTPException(status_code=500, detail=f"Malformed agent response: {exc}") from exc
 
-    prompt_entries = parsed.get("prompts")
+    if isinstance(parsed, list):
+        prompt_entries = parsed
+    else:
+        prompt_entries = parsed.get("prompts") if isinstance(parsed, dict) else None
+
     if not isinstance(prompt_entries, list):
         raise HTTPException(status_code=500, detail="Agent response missing `prompts` array.")
 

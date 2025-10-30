@@ -306,8 +306,12 @@ runs_history, runs_error = fetch_runs(experiment["id"])
 agent_runs, agent_runs_error = fetch_agent_runs(experiment["id"])
 agent_metrics_payload, agent_metrics_error = fetch_agent_metrics(experiment["id"])
 
-manual_tab, agent_tab, metrics_tab = st.tabs(
-    ["Manual Run", "Agent Lab", "Agent Metrics"]
+runs_lookup = {
+    item.get("id"): item for item in (runs_history or []) if item.get("id")
+}
+
+manual_tab, agent_tab, metrics_tab, explorer_tab = st.tabs(
+    ["Manual Run", "Agent Lab", "Agent Metrics", "Run Explorer"]
 )
 
 with manual_tab:
@@ -811,3 +815,173 @@ with metrics_tab:
             st.warning(f"Unable to load agent metrics: {agent_metrics_error}")
         else:
             st.info("Launch an automated agent run to populate aggregate metrics.")
+
+with explorer_tab:
+    st.markdown("### Run Explorer")
+    st.caption(
+        "Inspect stored runs, view judge assessments, and review generated prompt suites in detail."
+    )
+    run_source = st.radio(
+        "Run source",
+        ["Manual prompts", "Agent suites"],
+        horizontal=True,
+        key="run_explorer_source",
+    )
+
+    if run_source == "Manual prompts":
+        if runs_history:
+            manual_sorted = sorted(
+                runs_history,
+                key=lambda item: item.get("created_at", ""),
+                reverse=True,
+            )
+            manual_options = {
+                f"{entry.get('created_at', '')[:19].replace('T', ' ')} | {entry.get('id', '')[:8]} | {'BLOCKED' if entry.get('blocked') else ((entry.get('judge_scores') or {}).get('overall_pass') and 'PASS' or 'FAIL')}": entry
+                for entry in manual_sorted
+            }
+            selected_manual = st.selectbox(
+                "Select a stored prompt",
+                list(manual_options.keys()),
+                key="manual_run_selector",
+            )
+            run_entry = manual_options[selected_manual]
+
+            judge_scores = run_entry.get("judge_scores") or {}
+            detector_scores = run_entry.get("detector_scores") or {}
+            cols = st.columns(3)
+            cols[0].metric(
+                "Status",
+                "BLOCKED"
+                if run_entry.get("blocked")
+                else "PASS"
+                if judge_scores.get("overall_pass")
+                else "FAIL",
+            )
+            cols[1].metric(
+                "Safety", f"{judge_scores.get('safety', 0.0):.2f}"
+            )
+            cols[2].metric(
+                "Privacy risk", f"{judge_scores.get('privacy_risk', 0.0):.2f}"
+            )
+
+            st.markdown("#### Prompt")
+            st.code(run_entry.get("prompt") or "")
+            st.markdown("#### Response")
+            st.write(run_entry.get("response") or "_No response captured._")
+
+            details_col, meta_col = st.columns(2)
+            with details_col:
+                st.markdown("**Judge assessment**")
+                st.json(judge_scores)
+            with meta_col:
+                st.markdown("**Derived metrics**")
+                st.json(detector_scores)
+                metadata = run_entry.get("run_metadata") or {}
+                if metadata:
+                    st.markdown("**Metadata**")
+                    st.json(metadata)
+        else:
+            if runs_error:
+                st.warning(f"Unable to load run history: {runs_error}")
+            else:
+                st.info("No manual runs have been stored yet.")
+    else:
+        if agent_runs:
+            agent_options = {
+                f"{item.get('created_at', '')[:19].replace('T', ' ')} | {item.get('id', '')[:8]} | {item.get('generator_model', '')}": item
+                for item in sorted(
+                    agent_runs,
+                    key=lambda record: record.get("created_at", ""),
+                    reverse=True,
+                )
+            }
+            selected_agent = st.selectbox(
+                "Select an agent suite",
+                list(agent_options.keys()),
+                key="agent_run_selector",
+            )
+            agent_entry = agent_options[selected_agent]
+
+            st.markdown(
+                f"**Agent run ID:** `{agent_entry.get('id')}`  \
+**Created:** {agent_entry.get('created_at', '')[:19].replace('T', ' ')}"
+            )
+            cols = st.columns(4)
+            summary = agent_entry.get("execution_summary") or {}
+            cols[0].metric("Prompts", agent_entry.get("prompt_count", 0))
+            cols[1].metric(
+                "Pass rate", f"{summary.get('pass_rate', 0.0) * 100:.1f}%"
+            )
+            cols[2].metric(
+                "Avg toxicity", f"{summary.get('avg_toxicity', 0.0):.3f}"
+            )
+            cols[3].metric(
+                "Avg privacy risk", f"{summary.get('avg_privacy_risk', 0.0):.3f}"
+            )
+
+            generated = agent_entry.get("generated_prompts") or []
+            if generated:
+                st.markdown("#### Generated prompt blueprint")
+                blueprint_df = pd.DataFrame(
+                    [
+                        {
+                            "Title": item.get("title"),
+                            "Goal": item.get("goal"),
+                            "Metric focus": ", ".join(item.get("metric_focus") or []),
+                            "Checklist": ", ".join(item.get("checklist") or []),
+                        }
+                        for item in generated
+                    ]
+                )
+                st.dataframe(blueprint_df, width="stretch", hide_index=True)
+
+            run_ids = agent_entry.get("run_ids") or []
+            if not run_ids:
+                st.info("This agent run has not persisted response records.")
+            else:
+                for idx, run_id in enumerate(run_ids, start=1):
+                    run_detail = runs_lookup.get(run_id)
+                    if not run_detail:
+                        st.warning(f"Run `{run_id}` not found in history cache.")
+                        continue
+                    judge_scores = run_detail.get("judge_scores") or {}
+                    detector_scores = run_detail.get("detector_scores") or {}
+                    with st.expander(f"Prompt {idx}: {run_detail.get('id', '')[:8]}"):
+                        cols = st.columns(3)
+                        cols[0].metric(
+                            "Status",
+                            "BLOCKED"
+                            if run_detail.get("blocked")
+                            else "PASS"
+                            if judge_scores.get("overall_pass")
+                            else "FAIL",
+                        )
+                        cols[1].metric(
+                            "Safety", f"{judge_scores.get('safety', 0.0):.2f}"
+                        )
+                        cols[2].metric(
+                            "Privacy", f"{judge_scores.get('privacy_risk', 0.0):.2f}"
+                        )
+
+                        st.markdown("**Prompt**")
+                        st.code(run_detail.get("prompt") or "")
+                        st.markdown("**Response**")
+                        st.write(
+                            run_detail.get("response") or "_No response captured._"
+                        )
+                        inner_cols = st.columns(2)
+                        with inner_cols[0]:
+                            st.markdown("**Judge assessment**")
+                            st.json(judge_scores)
+                        with inner_cols[1]:
+                            st.markdown("**Derived metrics**")
+                            st.json(detector_scores)
+                            metadata = run_detail.get("run_metadata") or {}
+                            if metadata:
+                                st.markdown("**Metadata**")
+                                st.json(metadata)
+        else:
+            if agent_runs_error:
+                st.warning(f"Unable to load agent run history: {agent_runs_error}")
+            else:
+                st.info("No automated runs have been recorded yet.")
